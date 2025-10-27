@@ -1,0 +1,23 @@
+ARG BASE_REGISTRY=public.ecr.aws/docker/library/
+FROM ${BASE_REGISTRY}golang:1.23-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /app
+ENV GOTOOLCHAIN=auto
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go mod tidy
+RUN \
+  CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+  go build -ldflags="-s -w" -o /out/agent ./cmd/agent
+
+FROM ${BASE_REGISTRY}alpine:3.20
+WORKDIR /srv
+COPY --from=builder /out/agent /usr/local/bin/agent
+ENV API_BASE=http://api:8080
+ENV RESULTS_TOKEN=dev-token
+ENV REGION=unknown
+ENTRYPOINT ["/usr/local/bin/agent"]
+
+
