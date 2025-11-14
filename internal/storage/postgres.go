@@ -178,6 +178,7 @@ func (p *Postgres) UpdateTaskStatus(ctx context.Context, id uuid.UUID, status Ta
     return nil
 }
 
+// ListExpiredRunningTasks returns tasks that are still running but past their deadline.
 func (p *Postgres) ListExpiredRunningTasks(ctx context.Context) ([]CheckTask, error) {
     rows, err := p.pool.Query(ctx, `
         SELECT id, target, methods, status, expected_results, received_results, deadline, created_at, updated_at

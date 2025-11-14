@@ -42,6 +42,7 @@ func (r *RedisClient) EnqueueTask(ctx context.Context, job TaskJob) error {
     return r.client.LPush(ctx, defaultTaskQueueKey, string(b)).Err()
 }
 
+// FanOutTask pushes job into per-agent queues so каждый агент получает свою копию.
 func (r *RedisClient) FanOutTask(ctx context.Context, agentIDs []string, job TaskJob) error {
     b, err := json.Marshal(job)
     if err != nil { return err }

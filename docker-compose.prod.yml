@@ -1,0 +1,98 @@
+# Production Docker Compose configuration
+# Использует переменные из .env.prod файла
+# Запуск: docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+services:
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:15
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-aeza}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:15432:5432"  # Только локальный доступ, не конфликтует с другими БД
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h 127.0.0.1 -p 5432"]
+      interval: 5s
+      timeout: 3s
+      start_period: 30s
+      retries: 30
+    networks:
+      - syharikcheck_network
+
+  redis:
+    image: public.ecr.aws/docker/library/redis:7-alpine
+    ports:
+      # Для локального доступа (API сервер)
+      - "127.0.0.1:16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - syharikcheck_network
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      args:
+        BASE_REGISTRY: public.ecr.aws/docker/library/
+    environment:
+      API_PORT: "8080"
+      POSTGRES_DSN: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-aeza}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      RESULTS_TOKEN: ${RESULTS_TOKEN:-dev-token}
+      AGENTS_COUNT: ${AGENTS_COUNT:-1}
+      TASK_TTL_SECONDS: ${TASK_TTL_SECONDS:-15}
+      PUBLIC_API_BASE: ${PUBLIC_API_BASE:-http://localhost:8080}
+      EXTERNAL_REDIS_PORT: ${EXTERNAL_REDIS_PORT:-6379}
+      AGENT_IMAGE: aeza-agent:latest
+      DOCKER_NETWORK: syharikcheck_network
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASS: ${ADMIN_PASS:-admin}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18080:8080"  # Только локальный доступ, FastPanel будет проксировать
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - syharikcheck_network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend.prod
+      args:
+        REACT_APP_API_BASE: ${REACT_APP_API_BASE}
+    image: syharikcheck-frontend:prod
+    ports:
+      - "127.0.0.1:18000:80"  # Только локальный доступ, FastPanel будет проксировать
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - syharikcheck_network
+    restart: unless-stopped
+
+networks:
+  syharikcheck_network:
+    driver: bridge
+
+volumes:
+  pgdata:
+

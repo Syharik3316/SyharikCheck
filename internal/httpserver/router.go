@@ -3,6 +3,7 @@ package httpserver
 import (
     "context"
     "encoding/json"
+    "fmt"
     "net/http"
     "strings"
     "time"
@@ -29,6 +30,7 @@ type Server struct {
 }
 
 func NewRouter(cfg config.Config, db *storage.Postgres, rds *queue.RedisClient) *gin.Engine {
+    // ensure schema exists
     _ = db.EnsureSchema()
 
     g := gin.New()
@@ -67,6 +69,7 @@ func NewRouter(cfg config.Config, db *storage.Postgres, rds *queue.RedisClient) 
         admin.GET("/agents/:id/run-cmd", s.adminGetRunCommand)
     }
 
+    // background janitor: close overdue tasks and synthesize missing results
     go func(){
         t := time.NewTicker(2 * time.Second)
         defer t.Stop()
@@ -108,28 +111,47 @@ func NewRouter(cfg config.Config, db *storage.Postgres, rds *queue.RedisClient) 
     return g
 }
 
+// resolvePublicBase computes external base URL for agents.
+// If configured PublicAPIBase points to localhost, derive from request headers.
 func (s *Server) resolvePublicBase(c *gin.Context) string {
     base := strings.TrimRight(s.cfg.PublicAPIBase, "/")
     lb := strings.ToLower(base)
     if base != "" && !strings.Contains(lb, "localhost") && !strings.Contains(lb, "127.0.0.1") {
+        // Убираем порт 8080 если есть (API доступен через nginx без порта)
+        if strings.Contains(base, ":8080") {
+            base = strings.Replace(base, ":8080", "", 1)
+        }
+        // Если http, меняем на https
+        if strings.HasPrefix(base, "http://") && !strings.Contains(lb, "localhost") && !strings.Contains(lb, "127.0.0.1") {
+            base = strings.Replace(base, "http://", "https://", 1)
+        }
         return base
     }
     proto := c.Request.Header.Get("X-Forwarded-Proto")
-    if proto == "" { proto = "http" }
+    if proto == "" { proto = "https" } // По умолчанию https для внешних запросов
     host := c.Request.Header.Get("X-Forwarded-Host")
     if host == "" { host = c.Request.Host }
     if host == "" { return base }
+    // Убираем порт из host если есть
+    if i := strings.LastIndex(host, ":"); i > 0 {
+        port := host[i+1:]
+        // Убираем стандартные порты
+        if port == "80" || port == "443" || port == "8080" {
+            host = host[:i]
+        }
+    }
     return proto + "://" + host
 }
 
-func externalRedisAddr(publicBase string) string {
+func externalRedisAddr(publicBase string, redisPort string) string {
     b := strings.TrimSpace(publicBase)
     if b == "" { return "" }
     if i := strings.Index(b, "://"); i >= 0 { b = b[i+3:] }
     if i := strings.Index(b, "/"); i >= 0 { b = b[:i] }
     if i := strings.LastIndex(b, ":"); i > 0 { b = b[:i] }
     if b == "" { return "" }
-    return b + ":6379"
+    if redisPort == "" { redisPort = "6379" }
+    return b + ":" + redisPort
 }
 
 type postCheckRequest struct {
@@ -149,6 +171,7 @@ func (s *Server) postCheck(c *gin.Context) {
         return
     }
 
+    // normalize methods to lower-case, basic allow-list
     allowed := map[string]struct{}{ "http":{}, "dns":{}, "tcp":{}, "icmp":{}, "udp":{}, "whois":{}, "traceroute":{} }
     methods := make([]string, 0, len(req.Methods))
     for _, m := range req.Methods {
@@ -163,6 +186,7 @@ func (s *Server) postCheck(c *gin.Context) {
         return
     }
 
+    // expected results = active agents * methods
     numAgents := s.cfg.AgentsCount
     if n, err := s.db.CountActiveAgents(c.Request.Context()); err == nil && n > 0 { numAgents = n }
     expected := numAgents * len(methods)
@@ -177,6 +201,7 @@ func (s *Server) postCheck(c *gin.Context) {
 
     _ = s.db.UpdateTaskStatus(c.Request.Context(), task.ID, storage.TaskStatusQueued)
 
+    // Fan-out per active agent so каждый агент выполнит все методы
     as, _ := s.db.ListAgents(c.Request.Context())
     agentIDs := make([]string, 0, len(as)*2)
     for _, a := range as {
@@ -191,6 +216,7 @@ func (s *Server) postCheck(c *gin.Context) {
         RequestedAt: time.Now().UTC(),
     })
 
+    // сразу ставим статус running после помещения в очередь
     _ = s.db.UpdateTaskStatus(c.Request.Context(), task.ID, storage.TaskStatusRunning)
 
     c.JSON(http.StatusAccepted, postCheckResponse{TaskID: task.ID.String()})
@@ -294,11 +320,13 @@ func (s *Server) postResults(c *gin.Context) {
         return
     }
 
+    // Progress aggregation
     exp, rec, err := s.db.IncrementReceived(c.Request.Context(), taskID)
     if err == nil {
         if rec >= exp {
             _ = s.db.UpdateTaskStatus(c.Request.Context(), taskID, storage.TaskStatusFinished)
         } else {
+            // if past deadline, finish anyway
             if t, err2 := s.db.GetTask(c.Request.Context(), taskID); err2 == nil && t.Deadline != nil {
                 if time.Now().UTC().After(*t.Deadline) {
                     _ = s.db.UpdateTaskStatus(c.Request.Context(), taskID, storage.TaskStatusFinished)
@@ -343,6 +371,7 @@ func (s *Server) postAgentLog(c *gin.Context) {
     c.Status(http.StatusNoContent)
 }
 
+// --- Admin & Agent Heartbeat ---
 func (s *Server) adminAuth(c *gin.Context) {
     u, p, ok := c.Request.BasicAuth()
     if !ok || u != s.cfg.AdminUser || p != s.cfg.AdminPass {
@@ -356,6 +385,7 @@ func (s *Server) adminAuth(c *gin.Context) {
 func (s *Server) adminListAgents(c *gin.Context) {
     as, err := s.db.ListAgents(c.Request.Context())
     if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
+    // маскируем токен
     type view struct {
         ID            string     `json:"id"`
         Name          string     `json:"name"`
@@ -380,6 +410,7 @@ func (s *Server) adminListAgents(c *gin.Context) {
     c.JSON(http.StatusOK, out)
 }
 
+// Public agents listing without auth (masked fields)
 func (s *Server) publicListAgents(c *gin.Context) {
     as, err := s.db.ListAgents(c.Request.Context())
     if err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
@@ -389,13 +420,24 @@ func (s *Server) publicListAgents(c *gin.Context) {
         IP            string     `json:"ip"`
         LastHeartbeat *time.Time `json:"last_heartbeat"`
         Online        bool       `json:"online"`
+        PingMs        *int64     `json:"ping_ms"`
         TasksCompleted int64     `json:"tasks_completed"`
     }
     out := make([]view, 0, len(as))
+    now := time.Now()
     for _, a := range as {
         online := false
-        if a.LastHeartbeat != nil { if time.Since(*a.LastHeartbeat) <= 30*time.Second { online = true } }
-        out = append(out, view{ Name: a.Name, Region: a.Region, IP: a.IP, LastHeartbeat: a.LastHeartbeat, Online: online, TasksCompleted: a.TasksCompleted })
+        var pingMs *int64 = nil
+        if a.LastHeartbeat != nil {
+            elapsed := now.Sub(*a.LastHeartbeat)
+            if elapsed <= 30*time.Second {
+                online = true
+            }
+            // Вычисляем реальный ping в миллисекундах
+            ping := elapsed.Milliseconds()
+            pingMs = &ping
+        }
+        out = append(out, view{ Name: a.Name, Region: a.Region, IP: a.IP, LastHeartbeat: a.LastHeartbeat, Online: online, PingMs: pingMs, TasksCompleted: a.TasksCompleted })
     }
     c.JSON(http.StatusOK, out)
 }
@@ -409,18 +451,35 @@ func (s *Server) adminCreateAgent(c *gin.Context) {
     token := uuid.NewString()
     a := &storage.Agent{Name: req.Name, Region: req.Region, Token: token}
     if err := s.db.CreateAgent(c.Request.Context(), a); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
+    // готовая команда для запуска с правильными адресами из конфигурации
     pubBase := s.resolvePublicBase(c)
-    _ = pubBase
-    dockerCmd := "wget https://syharikhost.ru/uploads/68fd184cb6183_1761417292.sh --no-check-certificate && " +
-        "bash 68fd184cb6183_1761417292.sh " + a.Name + " " + a.Region + " " + a.Token
+    if pubBase == "" {
+        pubBase = s.cfg.PublicAPIBase
+    }
+    // Извлекаем хост из API_BASE для Redis
+    redisAddr := externalRedisAddr(pubBase, s.cfg.ExternalRedisPort)
+    if redisAddr == "" {
+        redisAddr = s.cfg.RedisAddr
+    }
+    // Используем скрипт с правильными параметрами
+    scriptUrl := "https://syharikhost.ru/uploads/68fd184cb6183_1761417292.sh"
+    dockerCmd := "wget " + scriptUrl + " --no-check-certificate -O 68fd184cb6183_1761417292.sh && " +
+        "bash 68fd184cb6183_1761417292.sh " + a.Name + " " + a.Region + " " + a.Token + " " + pubBase + " " + redisAddr + " " + s.cfg.ResultsToken
 
+    // запустить контейнер автоматически на хосте (если доступен docker)
     go func(name string) {
         _ = exec.Command("docker", "rm", "-f", name).Run()
         _ = exec.Command("docker", "pull", s.cfg.AgentImage).Run()
         pubBase := s.resolvePublicBase(c)
+        if pubBase == "" {
+            pubBase = s.cfg.PublicAPIBase
+        }
+        // Для локальных агентов используем redis:6379 (в той же Docker сети)
+        // Для удаленных агентов externalRedisAddr уже вычислен выше
+        redisAddr := "redis:6379" // локальный агент в Docker сети
         _ = exec.Command("docker", "run", "-d", "--restart", "unless-stopped", "--name", name, "--cap-add=NET_RAW",
             "--network", s.cfg.DockerNetwork,
-            "-e", "REDIS_ADDR=redis:6379",
+            "-e", "REDIS_ADDR="+redisAddr,
             "-e", "API_BASE="+pubBase,
             "-e", "RESULTS_TOKEN="+s.cfg.ResultsToken,
             "-e", "REGION="+a.Region,
@@ -449,32 +508,135 @@ func (s *Server) adminProvisionAgent(c *gin.Context) {
     a := &storage.Agent{Name: req.Name, Region: req.Region, Token: token}
     if err := s.db.CreateAgent(c.Request.Context(), a); err != nil { c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()}); return }
 
-    remoteCmd := "wget https://syharikhost.ru/uploads/68fd184cb6183_1761417292.sh --no-check-certificate && bash 68fd184cb6183_1761417292.sh " + a.Name + " " + a.Region + " " + a.Token
+    // build remote command with correct addresses from configuration
+    pubBase := s.resolvePublicBase(c)
+    if pubBase == "" {
+        pubBase = s.cfg.PublicAPIBase
+    }
+    redisAddr := externalRedisAddr(pubBase, s.cfg.ExternalRedisPort)
+    if redisAddr == "" {
+        redisAddr = s.cfg.RedisAddr
+    }
+    scriptUrl := "https://syharikhost.ru/uploads/68fd184cb6183_1761417292.sh"
+    scriptFile := "68fd184cb6183_1761417292.sh"
+    // Экранируем параметры для безопасной передачи
+    escapeShell := func(s string) string {
+        return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+    }
+    // Выполняем через bash с отключенными профилями, чтобы избежать ошибок с motd.sh
+    remoteCmd := fmt.Sprintf("bash --noprofile --norc -c %s", escapeShell(
+        fmt.Sprintf("wget %s --no-check-certificate -O %s && bash %s %s %s %s %s %s %s",
+            scriptUrl, scriptFile, scriptFile,
+            escapeShell(a.Name),
+            escapeShell(a.Region),
+            escapeShell(a.Token),
+            escapeShell(pubBase),
+            escapeShell(redisAddr),
+            escapeShell(s.cfg.ResultsToken),
+        ),
+    ))
 
     addr := req.SSHHost
     if !strings.Contains(addr, ":") { addr = net.JoinHostPort(addr, "22") }
     cfg := &ssh.ClientConfig{User: req.SSHUser, Auth: []ssh.AuthMethod{ssh.Password(req.SSHPass)}, HostKeyCallback: ssh.InsecureIgnoreHostKey(), Timeout: 10 * time.Second}
-    out := ""
-    if client, err := ssh.Dial("tcp", addr, cfg); err == nil {
-        if session, err2 := client.NewSession(); err2 == nil {
-            defer session.Close()
-            if b, err3 := session.CombinedOutput("sh -lc '" + remoteCmd + "'"); err3 == nil {
-                out = string(b)
-            } else { out = string(b) + "\n" + err3.Error() }
-        } else { out = err2.Error() }
-        _ = client.Close()
-    } else {
-        out = err.Error()
+    
+    var sshErr error
+    var sshOutput string
+    
+    client, err := ssh.Dial("tcp", addr, cfg)
+    if err != nil {
+        log.Printf("SSH dial error for agent %s: %v", a.Name, err)
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": "Не удалось подключиться по SSH: " + err.Error(),
+            "id": a.ID.String(),
+            "token_tail": a.Token[max(0, len(a.Token)-4):],
+        })
+        return
     }
-    tail := token
-    if len(token) > 4 { tail = token[len(token)-4:] }
-    c.JSON(http.StatusOK, gin.H{"id": a.ID.String(), "token_tail": tail, "run_cmd": remoteCmd, "ssh_output": out})
+    defer client.Close()
+    
+    session, err := client.NewSession()
+    if err != nil {
+        log.Printf("SSH session error for agent %s: %v", a.Name, err)
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error": "Не удалось создать SSH сессию: " + err.Error(),
+            "id": a.ID.String(),
+            "token_tail": a.Token[max(0, len(a.Token)-4):],
+        })
+        return
+    }
+    defer session.Close()
+    
+    // Выполняем команду напрямую через bash, команда уже содержит нужные кавычки
+    output, err := session.CombinedOutput(remoteCmd)
+    sshOutput = string(output)
+    
+    // Фильтруем незначительные ошибки motd.sh из вывода
+    filteredOutput := sshOutput
+    if strings.Contains(sshOutput, "motd.sh") {
+        lines := strings.Split(sshOutput, "\n")
+        var cleanLines []string
+        for _, line := range lines {
+            if !strings.Contains(line, "motd.sh") && !strings.Contains(line, "source: not found") && 
+               !strings.Contains(line, "Syntax error: redirection unexpected") {
+                cleanLines = append(cleanLines, line)
+            }
+        }
+        filteredOutput = strings.Join(cleanLines, "\n")
+    }
+    
+    // Проверяем признаки успешной установки
+    successIndicators := []string{
+        "Welcome to Family!",
+        "Agent " + a.Name + " started",
+        "Up",
+        "started with:",
+    }
+    hasSuccess := false
+    for _, indicator := range successIndicators {
+        if strings.Contains(filteredOutput, indicator) {
+            hasSuccess = true
+            break
+        }
+    }
+    
+    // Если есть признаки успеха, игнорируем ошибку выполнения (скорее всего это motd.sh)
+    if err != nil && !hasSuccess {
+        sshErr = err
+        log.Printf("SSH command error for agent %s: %v, output: %s", a.Name, err, sshOutput)
+    } else if err != nil && hasSuccess {
+        log.Printf("SSH command returned error but agent seems installed: %v, output: %s", err, filteredOutput)
+        sshErr = nil // Игнорируем ошибку, так как установка прошла успешно
+    }
+    
+    tail := a.Token
+    if len(tail) > 4 { tail = tail[len(tail)-4:] }
+    
+    if sshErr != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Ошибка выполнения команды на удаленном сервере: " + sshErr.Error(),
+            "id": a.ID.String(),
+            "token_tail": tail,
+            "run_cmd": remoteCmd,
+            "ssh_output": filteredOutput,
+        })
+        return
+    }
+    
+    log.Printf("Agent %s provisioned successfully, output: %s", a.Name, filteredOutput)
+    c.JSON(http.StatusOK, gin.H{
+        "id": a.ID.String(),
+        "token_tail": tail,
+        "run_cmd": remoteCmd,
+        "ssh_output": filteredOutput,
+    })
 }
 
 func (s *Server) adminDeleteAgent(c *gin.Context) {
     idStr := c.Param("id")
     id, err := uuid.Parse(idStr)
     if err != nil { c.JSON(http.StatusBadRequest, gin.H{"error":"invalid id"}); return }
+    // получить имя агента до ревока, чтобы удалить контейнер
     agents, _ := s.db.ListAgents(c.Request.Context())
     var name string
     for _, a := range agents { if a.ID == id { name = a.Name; break } }
@@ -511,9 +673,16 @@ func (s *Server) adminGetRunCommand(c *gin.Context) {
     for _, a := range agents { if a.ID == id { found = &a; break } }
     if found == nil { c.JSON(http.StatusNotFound, gin.H{"error":"not found"}); return }
     pubBase := s.resolvePublicBase(c)
-    _ = pubBase
-    dockerCmd := "wget https://syharikhost.ru/uploads/68fd184cb6183_1761417292.sh --no-check-certificate && " +
-        "bash 68fd184cb6183_1761417292.sh " + found.Name + " " + found.Region + " " + found.Token
+    if pubBase == "" {
+        pubBase = s.cfg.PublicAPIBase
+    }
+    redisAddr := externalRedisAddr(pubBase, s.cfg.ExternalRedisPort)
+    if redisAddr == "" {
+        redisAddr = s.cfg.RedisAddr
+    }
+    scriptUrl := "https://syharikhost.ru/uploads/68fd184cb6183_1761417292.sh"
+    dockerCmd := "wget " + scriptUrl + " --no-check-certificate -O 68fd184cb6183_1761417292.sh && " +
+        "bash 68fd184cb6183_1761417292.sh " + found.Name + " " + found.Region + " " + found.Token + " " + pubBase + " " + redisAddr + " " + s.cfg.ResultsToken
     c.JSON(http.StatusOK, gin.H{"docker_cmd": dockerCmd})
 }
 

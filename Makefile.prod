@@ -1,0 +1,63 @@
+# Production Makefile для сборки и управления проектом
+
+.PHONY: build-prod up-prod down-prod logs-prod restart-prod backup-db restore-db
+
+# Загрузить переменные из .env.prod
+include .env.prod
+export
+
+# Сборка production версии
+build-prod:
+	@echo "🚀 Сборка production версии..."
+	@if [ ! -f .env.prod ]; then \
+		echo "❌ Файл .env.prod не найден! Создайте его на основе env.prod.example"; \
+		exit 1; \
+	fi
+	@./build-prod.sh
+
+# Запуск production версии
+up-prod:
+	@echo "🚀 Запуск production версии..."
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+# Остановка production версии
+down-prod:
+	@echo "🛑 Остановка production версии..."
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod down
+
+# Просмотр логов
+logs-prod:
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f
+
+# Перезапуск production версии
+restart-prod:
+	@echo "🔄 Перезапуск production версии..."
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod restart
+
+# Бэкап базы данных
+backup-db:
+	@echo "💾 Создание бэкапа базы данных..."
+	@mkdir -p backups
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod exec -T postgres pg_dump -U $$POSTGRES_USER $$POSTGRES_DB > backups/backup_$$(date +%Y%m%d_%H%M%S).sql
+	@echo "✅ Бэкап создан в директории backups/"
+
+# Восстановление базы данных (использование: make restore-db FILE=backups/backup_20240101_120000.sql)
+restore-db:
+	@if [ -z "$(FILE)" ]; then \
+		echo "❌ Укажите файл для восстановления: make restore-db FILE=backups/backup_20240101_120000.sql"; \
+		exit 1; \
+	fi
+	@echo "📥 Восстановление базы данных из $(FILE)..."
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod exec -T postgres psql -U $$POSTGRES_USER $$POSTGRES_DB < $(FILE)
+	@echo "✅ База данных восстановлена"
+
+# Просмотр статуса контейнеров
+status-prod:
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod ps
+
+# Очистка (удаление контейнеров и volumes)
+clean-prod:
+	@echo "🧹 Очистка production окружения..."
+	@docker compose -f docker-compose.prod.yml --env-file .env.prod down -v
+	@echo "⚠️  Все данные удалены!"
+

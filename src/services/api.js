@@ -25,6 +25,7 @@ export function openResultsWS(onMessage) {
   return ws;
 }
 
+// --- Admin endpoints ---
 export async function adminListAgentsBasic(user, pass) {
   const resp = await fetch(`${API_BASE}/api/admin/agents`, {
     headers: { 'Authorization': 'Basic ' + btoa(`${user}:${pass}`) }

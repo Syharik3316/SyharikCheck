@@ -21,6 +21,7 @@ type Config struct {
     PublicAPIBase string
     AgentImage    string
     DockerNetwork string
+    ExternalRedisPort string
 }
 
 func getEnv(key, def string) string {
@@ -45,6 +46,7 @@ func Load() Config {
         PublicAPIBase: getEnv("PUBLIC_API_BASE", "http://api:8080"),
         AgentImage:    getEnv("AGENT_IMAGE", "aeza-agent:latest"),
         DockerNetwork: getEnv("DOCKER_NETWORK", "aeza_default"),
+        ExternalRedisPort: getEnv("EXTERNAL_REDIS_PORT", "6379"),
     }
     if v := os.Getenv("REDIS_DB"); v != "" {
         if n, err := strconv.Atoi(v); err == nil {

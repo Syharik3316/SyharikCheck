@@ -19,8 +19,11 @@ import (
     "github.com/google/uuid"
     "github.com/redis/go-redis/v9"
 )
+// best-effort GeoIP via ipapi.co (no key, rate-limited). Returns map or nil on error.
 func geoIPLookup(host string) map[string]any {
+    // If host is a URL, extract hostname
     h := hostnameForDNS(host)
+    // Try to resolve to IP if domain
     ip := h
     if net.ParseIP(h) == nil {
         if ips, err := net.LookupIP(h); err == nil && len(ips) > 0 {
@@ -67,6 +70,7 @@ func ensureHTTPURL(target string) string {
     if strings.HasPrefix(t, "http://") || strings.HasPrefix(t, "https://") {
         return t
     }
+    // if looks like host:port, prepend http://
     return "http://" + t
 }
 
@@ -87,9 +91,11 @@ func hostnameForDNS(target string) string {
             return u.Hostname()
         }
     }
+    // strip path if accidentally present
     if i := strings.Index(t, "/"); i > 0 {
         t = t[:i]
     }
+    // strip port if present
     if h, _, err := net.SplitHostPort(t); err == nil {
         return h
     }
@@ -137,7 +143,9 @@ func tcpAddress(target string) string {
             return net.JoinHostPort(host, port)
         }
     }
+    // if path present, strip after '/'
     if i := strings.Index(t, "/"); i > 0 { t = t[:i] }
+    // if no port, default 80
     if _, _, err := net.SplitHostPort(t); err != nil {
         return net.JoinHostPort(t, "80")
     }
@@ -153,9 +161,12 @@ func tcpCheck(target string) (ok bool, latency int64, msg string) {
     return true, time.Since(start).Milliseconds(), ""
 }
 
+// ICMP ping via external binary (portable MVP). Requires CAP_NET_RAW in container.
 func icmpCheck(target string) (ok bool, latency int64, msg string) {
     host := hostnameForDNS(target)
     start := time.Now()
+    // macOS uses different ping flags; use 1 echo universally: -c 1, and timeout 5s
+    // BusyBox ping uses -W as seconds for timeout; iputils uses ms. Для кросс-платформенности используем 5s.
     cmd := exec.Command("ping", "-c", "1", "-W", "5", host)
     if out, err := cmd.CombinedOutput(); err != nil {
         return false, time.Since(start).Milliseconds(), string(out)
@@ -163,8 +174,9 @@ func icmpCheck(target string) (ok bool, latency int64, msg string) {
     return true, time.Since(start).Milliseconds(), ""
 }
 
+// UDP check: try to Dial UDP and write empty packet (best-effort)
 func udpCheck(target string) (ok bool, latency int64, msg string) {
-    addr := tcpAddress(target)
+    addr := tcpAddress(target) // reuse host:port normalization
     start := time.Now()
     udpAddr, err := net.ResolveUDPAddr("udp", addr)
     if err != nil { return false, 0, err.Error() }
@@ -178,6 +190,7 @@ func udpCheck(target string) (ok bool, latency int64, msg string) {
     return true, time.Since(start).Milliseconds(), ""
 }
 
+// WHOIS query using TCP port 43 (basic)
 func whoisCheck(target string) (ok bool, latency int64, msg string) {
     host := hostnameForDNS(target)
     start := time.Now()
@@ -190,14 +203,17 @@ func whoisCheck(target string) (ok bool, latency int64, msg string) {
     }
     buf := make([]byte, 256)
     if _, err := conn.Read(buf); err != nil {
+        // even если не прочитали — сам факт коннекта уже успех
         return true, time.Since(start).Milliseconds(), "partial read"
     }
     return true, time.Since(start).Milliseconds(), ""
 }
 
+// Traceroute using system traceroute (best-effort)
 func traceroute(target string) (ok bool, latency int64, msg string, hops []map[string]any) {
     host := hostnameForDNS(target)
     start := time.Now()
+    // BusyBox: traceroute -m 20 -w 2 host
     cmd := exec.Command("traceroute", "-m", "20", "-w", "2", host)
     out, err := cmd.CombinedOutput()
     if err != nil { return false, time.Since(start).Milliseconds(), string(out), nil }
@@ -205,10 +221,12 @@ func traceroute(target string) (ok bool, latency int64, msg string, hops []map[s
     for _, ln := range lines {
         line := strings.TrimSpace(ln)
         if line == "" { continue }
+        // expected: "1 hostname (ip) rtt ms rtt ms rtt ms" or with stars
         fields := strings.Fields(line)
         if len(fields) == 0 { continue }
         hopNum := fields[0]
         var hostPart, ipPart string
+        // find (ip)
         if i := strings.Index(line, "("); i >= 0 {
             if j := strings.Index(line[i:], ")"); j > 0 {
                 ipPart = strings.TrimSpace(line[i+1 : i+j])
@@ -264,6 +282,7 @@ func main() {
     rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB})
     ctx := context.Background()
 
+    // heartbeat loop
     go func(){
         t := time.NewTicker(15 * time.Second)
         defer t.Stop()
@@ -275,6 +294,7 @@ func main() {
         }
     }()
 
+    // consume per-agent queue if present, else fall back to shared queue
     queueKey := "check_tasks:" + cfg.AgentID
     for {
         res, err := rdb.BRPop(ctx, 0, queueKey, "check_tasks").Result()
@@ -283,6 +303,7 @@ func main() {
         var job queue.TaskJob
         if err := json.Unmarshal([]byte(res[1]), &job); err != nil { log.Printf("bad job: %v", err); continue }
 
+        // последовательное выполнение методов с логами
         sendLog(ctx, cfg, job.TaskID.String(), "start", fmt.Sprintf("Начало проверки: %v", job.Methods))
         for _, m0 := range job.Methods {
             m := strings.ToLower(m0)

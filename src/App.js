@@ -101,15 +101,18 @@ export default function App() {
             <div className="brand-title title-glow">SyharikCheck</div>
           </div>
           <div className="nav-actions">
-            <button className="btn-ghost" onClick={()=> navigate('/')}>На главную</button>
-            <button className="btn-ghost" onClick={()=> navigate('/metrics')}>Метрики</button>
-            <button className="btn-ghost" onClick={()=> navigate('/admin')}>Админ</button>
+            <button className="btn-ghost" onClick={()=> navigate('/')}>Проверка доступности</button>
+            <button className="btn-ghost" onClick={()=> navigate('/ports')}>Проверка портов</button>
+            <button className="btn-ghost" onClick={()=> navigate('/metrics')}>Состояние агентов</button>
+            <button className="btn-ghost" onClick={()=> navigate('/admin')}>Панель администратора</button>
           </div>
         </div>
         {route === '/admin' ? (
           <AdminPanel show onClose={()=> navigate('/')} />
         ) : route === '/metrics' ? (
           <MetricsPage onBack={()=> navigate('/')} />
+        ) : route === '/ports' ? (
+          <PortsCheckPage onBack={()=> navigate('/')} />
         ) : (
         <div className="info-display">
           <div style={{ display:'flex', gap:12, alignItems:'center' }}>
@@ -169,7 +172,7 @@ export default function App() {
       {showAdmin && (
         <div className="info-display" style={{ marginTop: 20 }}>
           <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
-            <h3>Админ-панель</h3>
+            <h3>Панель администратора</h3>
             <button className="btn-ghost" onClick={()=>setShowAdmin(false)}>Закрыть</button>
           </div>
           <div style={{ marginTop: 10, display:'flex', gap:12, alignItems:'center' }}>
@@ -273,6 +276,19 @@ export default function App() {
   );
 }
 
+function PortsCheckPage({ onBack }){
+  return (
+    <div className="info-display">
+      <div style={{ display:'flex', justifyContent:'center', alignItems:'center', marginBottom: 20 }}>
+        <h3>Проверка портов</h3>
+      </div>
+      <div style={{ textAlign: 'center', padding: '40px 20px', color: '#888' }}>
+        <p style={{ fontSize: '18px', marginBottom: '10px' }}>В разработке.</p>
+      </div>
+    </div>
+  );
+}
+
 function MetricsPage({ onBack }){
   const [agents, setAgents] = useState([]);
   useEffect(()=>{
@@ -281,7 +297,7 @@ function MetricsPage({ onBack }){
   return (
     <div className="info-display">
       <div style={{ display:'flex', justifyContent:'center', alignItems:'center', marginBottom: 20 }}>
-        <h3>Агенты</h3>
+        <h3>Состояние агентов</h3>
       </div>
       <table>
         <thead>
@@ -297,7 +313,11 @@ function MetricsPage({ onBack }){
         </thead>
         <tbody>
           {agents.map(a => {
-            const pingMs = a.last_heartbeat ? Math.max(0, Math.round((Date.now() - Date.parse(a.last_heartbeat)))) : null;
+            // Используем реальный ping из API (в миллисекундах)
+            const pingMs = a.ping_ms != null ? a.ping_ms : null;
+            const pingDisplay = pingMs != null 
+              ? (pingMs < 1000 ? `${pingMs}ms` : `${(pingMs / 1000).toFixed(1)}s`)
+              : '—';
             return (
               <tr key={a.name}>
                 <td>{a.name}</td>
@@ -305,7 +325,7 @@ function MetricsPage({ onBack }){
                 <td>{a.ip || '—'}</td>
                 <td>{a.last_heartbeat || '—'}</td>
                 <td>{a.online ? '🟢 онлайн' : '🔴 офлайн'}</td>
-                <td>{pingMs!=null ? `~${Math.floor(pingMs/1000)}s` : '—'}</td>
+                <td>{pingDisplay}</td>
                 <td>{a.tasks_completed || '—'}</td>
               </tr>
             );
@@ -392,15 +412,21 @@ function AdminPanel({ show, onClose }){
                 setIsProvisioningAgent(true);
                 try {
                   const resp = await fetch('/api/admin/agents/provision', { method:'POST', headers:{ 'Content-Type':'application/json', ...authHeader() }, body: JSON.stringify(payload)});
-                  if (!resp.ok) throw new Error('bad');
-                  await resp.json();
-                  alert('Агент успешно добавлен и развёрнут.');
+                  const data = await resp.json();
+                  if (!resp.ok || data.error) {
+                    const errorMsg = data.error || 'Неизвестная ошибка';
+                    alert('Ошибка: ' + errorMsg + (data.ssh_output ? '\n\nВывод:\n' + data.ssh_output : ''));
+                    throw new Error(errorMsg);
+                  }
+                  alert('Агент успешно добавлен и развёрнут.' + (data.ssh_output ? '\n\nВывод:\n' + data.ssh_output : ''));
                   setModalOpen(false);
                   setNewAgentName(''); setSshHost(''); setSshUser('root'); setSshPass('');
                   const list = await fetch('/api/admin/agents', { headers:{ ...authHeader() } }).then(r=>r.json());
                   setAgents(list);
-                } catch {
-                  alert('Не удалось создать и развернуть агента');
+                } catch (e) {
+                  if (e.message && !e.message.includes('Ошибка:')) {
+                    alert('Не удалось создать и развернуть агента: ' + e.message);
+                  }
                 } finally {
                   setIsProvisioningAgent(false);
                 }

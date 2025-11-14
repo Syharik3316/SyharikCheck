@@ -1,0 +1,18 @@
+[Unit]
+Description=SyharikCheck - Monitoring Service (Docker Compose)
+Requires=docker.service
+After=docker.service network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/var/www/syharikcheck.ru
+ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml --env-file .env.prod down
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
